@@ -1,254 +1,277 @@
 #!/bin/bash
-#===============================================================================
-# Rezoravpn Reverse Tunnel Installer v1.3 - Production Ready
-# SSH Reverse Tunnel for Iran-Out (DPI Resistant)
-# Single file - No dependencies - Works everywhere
-#===============================================================================
+
+# Reverse Tunnel Manager - Optimized for Iran DPI 2026
+# Features: Trojan TLS Server + autossh Reverse + systemd
+# Author: Perplexity AI - Based on best practices [web:19][web:22][web:23]
 
 set -euo pipefail
 
-# Colors (Terminal safe)
-RED='\033[0;31m' GREEN='\033[0;32m' YELLOW='\033[1;33m' BLUE='\033[0;34m'
-CYAN='\033[0;36m' NC='\033[0m'
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
 
-BOLD=$(tput bold 2>/dev/null || true) NORM=$(tput sgr0 2>/dev/null || true)
+# Paths
+INSTALL_DIR="/opt/reverse-tunnel"
+SERVICE_NAME="reverse-tunnel"
+CONFIG_DIR="$INSTALL_DIR/config"
+LOGS_DIR="$INSTALL_DIR/logs"
+TROJAN_CONFIG="$CONFIG_DIR/trojan-server.json"
+SSH_KEY_PUB="$CONFIG_DIR/id_rsa.pub"
+SSH_KEY_PRIV="$CONFIG_DIR/id_rsa"
 
-# Logo (ASCII only)
-logo() {
+echo -e "${BLUE}=== Reverse Tunnel Manager v1.0 ===${NC}"
+echo -e "${YELLOW}Optimized for Iran-Outbound Reverse Tunneling${NC}"
+
+# Detect OS
+if [[ ! $(uname -s) =~ ^(Linux)$ ]]; then
+    echo -e "${RED}Only Linux supported${NC}"
+    exit 1
+fi
+
+# Install dependencies
+install_deps() {
+    echo -e "${BLUE}Installing dependencies...${NC}"
+    apt update -qq
+    apt install -y curl wget unzip socat autossh nginx-full acme.sh jq ufw systemd-journal-remote || {
+        apt install -y curl wget unzip socat autossh nginx-full certbot python3-certbot-nginx jq ufw
+    }
+}
+
+# Create directories and user
+setup_dirs() {
+    mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$LOGS_DIR"
+    useradd -r -s /bin/false -d "$INSTALL_DIR" -m tunnel || true
+    chown -R tunnel:tunnel "$INSTALL_DIR"
+}
+
+# Generate SSH keys
+gen_ssh_keys() {
+    if [[ ! -f "$SSH_KEY_PRIV" ]]; then
+        echo -e "${BLUE}Generating SSH keys...${NC}"
+        sudo -u tunnel ssh-keygen -t rsa -b 4096 -f "$SSH_KEY_PRIV" -N "" -q
+        chown tunnel:tunnel "$SSH_KEY_PRIV" "$SSH_KEY_PUB"
+    fi
+    echo -e "${GREEN}SSH Public Key:${NC} $(cat "$SSH_KEY_PUB")"
+}
+
+# Main menu
+show_menu() {
     clear
-    echo -e "${CYAN}${BOLD}"
-    echo "  _____                        _   _      _            "
-    echo " / ____|                      | | | |    | |           "
-    echo "| |  __  ___ _ __   ___ _ __ | |_| |__  | |_ ___  ___ "
-    echo "| | |_ |/ _ \\ '_ \\ / _ \\ '_ \\| __| '_ \\ | __/ _ \\/ __|"
-    echo "| |__| |  __/ | | |  __/ | | | |_| | | | | ||  __/\\__ \\"
-    echo " \\_____|\\___|_| |_|\\___|_| |_|\\__|_| |_|  \\__\\___||___/"
-    echo "                       Rezoravpn Reverse Tunnel v1.3   "
-    echo -e "${NC}${NORM}"
+    echo -e "${BLUE}=== Reverse Tunnel Menu ===${NC}"
+    echo "1. Install Server Mode (Outside VPS)"
+    echo "2. Install Client Mode (Iran VPS)"
+    echo "3. Status"
+    echo "4. Restart"
+    echo "5. Stop"
+    echo "6. Uninstall"
+    echo "7. Logs"
+    echo "8. Edit Config"
+    echo "q. Quit"
+    read -p "Choose: " choice
 }
 
-success() { echo -e "${GREEN}${BOLD}OK: $1${NC}${NORM}"; }
-warn()   { echo -e "${YELLOW}${BOLD}WARN: $1${NC}${NORM}"; }
-error()  { echo -e "${RED}${BOLD}ERROR: $1${NC}${NORM}"; }
-info()   { echo -e "${CYAN}${BOLD}INFO: $1${NC}${NORM}"; }
+# Server Mode (Outside)
+install_server() {
+    echo -e "${BLUE}=== Server Mode Setup ===${NC}"
+    read -p "Domain (e.g. tunnel.example.com): " DOMAIN
+    read -p "Email for LetsEncrypt: " EMAIL
+    read -p "Trojan Password (auto-gen if empty): " TROJAN_PASS
 
-# Root check
-root_check() {
-    [[ $EUID -ne 0 ]] && { error "Run as root/sudo"; exit 1; }
+    if [[ -z "$TROJAN_PASS" ]]; then
+        TROJAN_PASS=$(openssl rand -base64 32)
+        echo -e "${GREEN}Generated Password: $TROJAN_PASS${NC}"
+    fi
+
+    # Trojan config with sing-box style [web:22][web:30]
+    cat > "$TROJAN_CONFIG" << EOF
+{
+    "log": {"level": "warn"},
+    "inbounds": [{
+        "type": "trojan",
+        "listen": "::",
+        "listen_port": 443,
+        "users": [{"name": "user", "password": "$TROJAN_PASS"}],
+        "tls": {
+            "enabled": true,
+            "acme": {
+                "domain": "$DOMAIN",
+                "email": "$EMAIL"
+            }
+        },
+        "multiplex": {"enabled": true, "max_streams": 2}
+    }],
+    "outbounds": [{"type": "direct"}]
 }
-
-# Install minimal deps
-deps_install() {
-    info "Installing dependencies..."
-    apt update -qq 2>/dev/null || yum update -q 2>/dev/null || true
-    apt install -y -qq openssh-server autossh curl nc jq 2>/dev/null || \
-    yum install -y -q openssh-server autossh curl nc bind-utils jq 2>/dev/null || \
-    dnf install -y -q openssh-server autossh curl nc bind-utils jq 2>/dev/null || \
-    { error "Package manager failed"; exit 1; }
-    success "Dependencies OK"
-}
-
-# SSH config for REMOTE server
-ssh_remote_setup() {
-    info "Configuring SSH for reverse tunnel..."
-    mkdir -p /etc/ssh/sshd_config.d
-    cat > /etc/ssh/sshd_config.d/99-rezora.conf << 'EOF'
-# Rezoravpn Reverse Tunnel - Optimized for Iran
-PermitRootLogin yes
-PasswordAuthentication yes
-GatewayPorts clientspecified
-AllowTcpForwarding global
-PermitTunnel yes
-ClientAliveInterval 60
-ClientAliveCountMax 3
-TCPKeepAlive yes
-UseDNS no
-AcceptEnv *
-MaxSessions 100
-MaxStartups 100:30:200
 EOF
-    systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
-    systemctl enable sshd 2>/dev/null || systemctl enable ssh 2>/dev/null
-    success "SSH remote ready"
+
+    # Nginx fallback for camouflage
+    cat > /etc/nginx/sites-available/tunnel << EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $DOMAIN;
+    return 301 https://\$server_name\$request_uri;
 }
 
-# Save client config
-client_config_save() {
-    mkdir -p /etc/rezora
-    cat > /etc/rezora/env << EOF
-REMOTE_IP="$REMOTE_IP"
-REMOTE_PORT="$REMOTE_PORT"
-REMOTE_USER="$REMOTE_USER"
-PORTS="$PORTS"
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name $DOMAIN;
+    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+    location / { return 200 "OK"; }
+}
 EOF
-}
+    ln -sf /etc/nginx/sites-available/tunnel /etc/nginx/sites-enabled/
+    nginx -t && systemctl restart nginx
 
-# Systemd service template
-systemd_template() {
-    cat > /etc/systemd/system/rezora-tunnel@.service << 'EOF'
+    # Sing-box binary (download latest)
+    wget -O /tmp/sing-box.tar.gz https://github.com/SagerNet/sing-box/releases/latest/download/sing-box-$(uname -m)-linux.tar.gz
+    tar -xzf /tmp/sing-box.tar.gz -C /tmp
+    install -m 755 /tmp/sing-box-$(uname -m)-linux/sing-box "$INSTALL_DIR/sing-box"
+    chown tunnel:tunnel "$INSTALL_DIR/sing-box"
+
+    # Systemd service for server
+    cat > /etc/systemd/system/$SERVICE_NAME-server.service << EOF
 [Unit]
-Description=Rezoravpn Reverse SSH Tunnel - Port %i
-After=network-online.target
-Wants=network-online.target
+Description=Reverse Tunnel Trojan Server
+After=network-online.target nginx.service
 
 [Service]
-Type=simple
-User=root
-EnvironmentFile=/etc/rezora/env
-ExecStartPre=/bin/sh -c 'echo "Tunnel %%i -> ${REMOTE_IP}:${REMOTE_PORT}"'
-ExecStart=/usr/bin/autossh -M 0 -N -T -q \
-  -o ServerAliveInterval=60 \
-  -o ServerAliveCountMax=3 \
-  -o ExitOnForwardFailure=yes \
-  -o StrictHostKeyChecking=no \
-  -o UserKnownHostsFile=/dev/null \
-  -o BatchMode=no \
-  -o ConnectTimeout=10 \
-  -p ${REMOTE_PORT} \
-  -R 0.0.0.0:%i:127.0.0.1:%i \
-  ${REMOTE_USER}@${REMOTE_IP}
-ExecStop=/bin/pkill -f "autossh.*%i"
+User=tunnel
+WorkingDirectory=$INSTALL_DIR
+ExecStart=$INSTALL_DIR/sing-box run -c $TROJAN_CONFIG
 Restart=always
-RestartSec=20
-TimeoutStopSec=10
+RestartSec=5
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
+    # UFW
+    ufw allow 22,80,443/tcp
+
     systemctl daemon-reload
+    systemctl enable $SERVICE_NAME-server
+    systemctl start $SERVICE_NAME-server
+
+    echo -e "${GREEN}Server installed!${NC}"
+    echo "Trojan URL: trojan://$TROJAN_PASS@$DOMAIN:443?security=tls&type=tcp&sni=$DOMAIN#Reverse-Tunnel"
+    echo "SSH Pubkey for Iran client: $(cat $SSH_KEY_PUB)"
 }
 
-# Menu
-show_menu() {
-    logo
-    cat << EOF
+# Client Mode (Iran)
+install_client() {
+    echo -e "${BLUE}=== Client Mode Setup (Iran VPS) ===${NC}"
+    read -p "Outside Server IP/Domain: " REMOTE_HOST
+    read -p "Outside SSH Port (default 22): " REMOTE_PORT
+    REMOTE_PORT=${REMOTE_PORT:-22}
+    read -p "Local Ports to Reverse (e.g. 80,443,8080): " LOCAL_PORTS
+    read -p "Remote User (default tunnel): " REMOTE_USER
+    REMOTE_USER=${REMOTE_USER:-tunnel}
 
-[1] Install REMOTE server (Outside Iran)
-[2] Install CLIENT server (Iran VPS)  
-[3] Status check
-[4] Live logs
-[5] Test ports
-[6] Restart all
-[7] Full uninstall
-[0] Exit
+    # Copy SSH key to remote (expect pubkey pasted)
+    gen_ssh_keys
+    read -p "Paste Outside SSH Pubkey or press Enter if already added: " dummy
 
+    # Reverse ports template
+    REVERSE_CMD="ServerAliveInterval=30 ServerAliveCountMax=3"
+    for PORT in $LOCAL_PORTS; do
+        REVERSE_CMD="$REVERSE_CMD -R $PORT:localhost:$PORT"
+    done
+
+    # Autossh config
+    cat > "$CONFIG_DIR/autossh.conf" << EOF
+AUTOSSH_GATETIME=0
+AUTOSSH_PORT=0
+REMOTE_HOST=$REMOTE_HOST
+REMOTE_PORT=$REMOTE_PORT
+REMOTE_USER=$REMOTE_USER
+REVERSE_CMD="$REVERSE_CMD"
 EOF
-    read -p "Choice (0-7): " opt
-}
 
-# 1. REMOTE install
-opt_remote() {
-    logo
-    info "REMOTE server setup (Outside Iran)..."
-    deps_install
-    ssh_remote_setup
-    success "REMOTE ready! Use option 2 on Iran VPS"
-    warn "Open ports: ufw allow 22,443,8443"
-}
+    # Systemd client service [web:23][web:27]
+    cat > /etc/systemd/system/$SERVICE_NAME-client@.service << EOF
+[Unit]
+Description=Reverse Tunnel Client to %i
+After=network-online.target
+Wants=network-online.target
 
-# 2. CLIENT install  
-opt_client() {
-    logo
-    info "CLIENT setup (Iran VPS)..."
-    deps_install
-    
-    # Inputs with validation
-    while [[ ! $REMOTE_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; do
-        read -p "REMOTE IP: " REMOTE_IP
-    done
-    
-    read -p "REMOTE SSH port [22]: " REMOTE_PORT; REMOTE_PORT=${REMOTE_PORT:-22}
-    read -p "REMOTE user [root]: " REMOTE_USER; REMOTE_USER=${REMOTE_USER:-root}
-    read -s -p "REMOTE password: " REMOTE_PASS; echo
-    
-    echo "Tunnel ports (space separated, default 443 8443):"
-    read -ra PORTS; [[ ${#PORTS[@]} -eq 0 ]] && PORTS=(443 8443 2083 8080)
-    
-    client_config_save
-    systemd_template
-    
-    # Enable & start
-    for p in "${PORTS[@]}"; do
-        systemctl enable "rezora-tunnel@${p}"
-        systemctl start "rezora-tunnel@${p}"
-    done
-    
-    success "CLIENT ready! Ports: ${PORTS[*]}"
-    info "Test: ssh root@IRAN_IP -p443"
-}
+[Service]
+User=tunnel
+Group=tunnel
+EnvironmentFile=$CONFIG_DIR/autossh.conf
+ExecStart=/usr/bin/autossh -M 0 -o "StrictHostKeyChecking=no" -o "$REVERSE_CMD" %i
+ExecStop=/usr/bin/pkill -f "autossh.*%i"
+Restart=always
+RestartSec=10
 
-# 3. Status
-opt_status() {
-    logo
-    info "Service status:"
-    systemctl list-units "rezora-tunnel@*" --state=active,failed 2>/dev/null || true
-    echo
-    systemctl status "rezora-tunnel@*" --no-pager -l 2>/dev/null | head -25 || true
-}
+[Install]
+WantedBy=multi-user.target
+EOF
 
-# 4. Logs
-opt_logs() {
-    logo
-    info "Live logs (Ctrl+C to exit)"
-    journalctl -u rezora-tunnel@* -f --no-pager -l
-}
+    # Healthcheck script
+    cat > "$INSTALL_DIR/healthcheck.sh" << 'EOF'
+#!/bin/bash
+HOST="$1"
+PORT="${2:-22}"
+nc -z -w3 "$HOST" "$PORT" 2>/dev/null && echo "UP" || echo "DOWN"
+EOF
+    chmod +x "$INSTALL_DIR/healthcheck.sh"
 
-# 5. Test
-opt_test() {
-    logo
-    read -p "Test port [443]: " port; port=${port:-443}
-    if nc -z -w 3 127.0.0.1 "$port" 2>/dev/null; then
-        success "Port $port: OPEN"
-    else
-        error "Port $port: CLOSED/TIMEOUT"
-    fi
-}
-
-# 6. Restart
-opt_restart() {
-    logo
-    info "Restarting all tunnels..."
-    systemctl restart rezora-tunnel@* 2>/dev/null || true
-    sleep 2
-    systemctl status rezora-tunnel@* --no-pager 2>/dev/null | head -20
-    success "Restart complete"
-}
-
-# 7. Uninstall
-opt_uninstall() {
-    logo
-    echo -n "Full uninstall? (y/N): "; read -r yn
-    [[ $yn =~ [Yy] ]] || { warn "Cancelled"; return; }
-    
-    systemctl stop rezora-tunnel@* 2>/dev/null || true
-    systemctl disable rezora-tunnel@* 2>/dev/null || true
-    rm -f /etc/systemd/system/rezora-tunnel@.service
-    rm -rf /etc/rezora /etc/ssh/sshd_config.d/99-rezora.conf
     systemctl daemon-reload
-    success "Clean uninstall complete"
+    systemctl enable $SERVICE_NAME-client@$REMOTE_HOST
+    systemctl start $SERVICE_NAME-client@$REMOTE_HOST
+
+    echo -e "${GREEN}Client installed! Tunnel: $LOCAL_PORTS <- $REMOTE_HOST${NC}"
+}
+
+# Status
+status() {
+    systemctl status $SERVICE_NAME-server $SERVICE_NAME-client@* --no-pager 2>/dev/null | grep -E "(Active|Loaded)" || echo "No services found"
+    ss -tulpn | grep -E "(:443|:22|:80)"
+}
+
+# Other functions
+case_cmd() {
+    case "$1" in
+        restart) systemctl restart $SERVICE_NAME-*-client@* $SERVICE_NAME-server 2>/dev/null || true ;;
+        stop) systemctl stop $SERVICE_NAME-*-client@* $SERVICE_NAME-server 2>/dev/null || true ;;
+        uninstall)
+            systemctl stop $SERVICE_NAME-*-client@* $SERVICE_NAME-server 2>/dev/null || true
+            systemctl disable $SERVICE_NAME-*-client@* $SERVICE_NAME-server 2>/dev/null || true
+            rm -rf "$INSTALL_DIR" /etc/systemd/system/$SERVICE_NAME*.service /etc/nginx/sites-enabled/tunnel
+            systemctl daemon-reload
+            nginx -t && systemctl restart nginx
+            userdel tunnel || true
+            echo -e "${GREEN}Uninstalled${NC}"
+            ;;
+        logs) journalctl -u $SERVICE_NAME-* -f ;;
+        edit) nano "$CONFIG_DIR"/* ;;
+    esac
 }
 
 # Main loop
-main_loop() {
-    while true; do
-        root_check
-        show_menu
-        
-        case $opt in
-            1) opt_remote ;;
-            2) opt_client ;;
-            3) opt_status ;;
-            4) opt_logs ;;
-            5) opt_test ;;
-            6) opt_restart ;;
-            7) opt_uninstall ;;
-            0|q|Q) success "Bye!"; exit 0 ;;
-            *) error "Invalid: 0-7";;
-        esac
-        
-        echo; info "Press Enter..."; read -r
-    done
-}
+install_deps
+setup_dirs
 
-# Run!
-main_loop "$@"
+while true; do
+    show_menu
+    case "$choice" in
+        1) install_server ;;
+        2) install_client ;;
+        3) status ;;
+        4) case_cmd restart ;;
+        5) case_cmd stop ;;
+        6) case_cmd uninstall && exit 0 ;;
+        7) case_cmd logs ;;
+        8) case_cmd edit ;;
+        q|Q) exit 0 ;;
+        *) echo "Invalid" ;;
+    esac
+    read -p "Press Enter to continue..."
+done
